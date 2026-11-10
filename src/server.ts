@@ -73,9 +73,12 @@ async function addDiscordRole(guildId: string, userId: string, roleId: string) {
     await discordRest.put(Routes.guildMemberRole(guildId, userId, roleId), {
       reason: "VIP Ativado via Stripe",
     });
-    console.log(`[Discord] Cargo ${roleId} concedido com sucesso para ${userId}.`);
-  } catch (error) {
-    console.error(`[Discord] Falha ao adicionar cargo ${roleId} para ${userId}:`, error);
+    console.log(`[Discord] ✅ Cargo ${roleId} concedido com sucesso para ${userId}.`);
+  } catch (error: any) {
+    console.error(`[Discord] ❌ Falha ao adicionar cargo ${roleId} para ${userId}:`, error?.message || error);
+    if (error?.status === 403) {
+      console.error("[Discord] ⚠️ DICA DE PERMISSÃO: Verifique se o Bot tem a permissão 'Gerenciar Cargos' e se o cargo do Bot está ACIMA do cargo VIP na hierarquia do servidor!");
+    }
   }
 }
 
@@ -181,65 +184,85 @@ app.post(
 
           if (!guildId || !userId || !roleId) {
             console.warn("[Webhook] Sessão de checkout sem metadados suficientes:", session.id);
-            break;
+            res.status(200).json({ received: true, warning: "Missing metadata" });
+            return;
           }
 
-          let currentPeriodEnd = new Date();
+          let currentPeriodEnd = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+
           if (purchaseType === "subscription" && session.subscription) {
-            const subObj = await stripe.subscriptions.retrieve(String(session.subscription));
-            currentPeriodEnd = new Date(subObj.current_period_end * 1000);
-          } else {
-            // Pagamento avulso (Pix ou Cartão)
-            currentPeriodEnd = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+            try {
+              const subObj = await stripe.subscriptions.retrieve(String(session.subscription));
+              if (subObj && (subObj as any).current_period_end) {
+                currentPeriodEnd = new Date((subObj as any).current_period_end * 1000);
+              }
+            } catch (subErr: any) {
+              console.warn(`[Webhook] Não foi possível consultar assinatura no Stripe (${session.subscription}):`, subErr?.message);
+              console.log(`[Webhook] Usando período padrão de ${durationDays} dias como fallback.`);
+            }
           }
 
           // Atualiza ou Cria a Assinatura no Banco
-          await VipSubscription.findOneAndUpdate(
-            { guildId, userId, tierId },
-            {
-              $set: {
-                guildId,
-                userId,
-                tierId,
-                roleId,
-                type: purchaseType,
-                status: "active",
-                stripeCustomerId: session.customer ? String(session.customer) : null,
-                stripeSubscriptionId: session.subscription ? String(session.subscription) : null,
-                stripeSessionId: session.id,
-                currentPeriodEnd,
-                cancelAtPeriodEnd: false,
+          try {
+            await VipSubscription.findOneAndUpdate(
+              { guildId, userId, tierId },
+              {
+                $set: {
+                  guildId,
+                  userId,
+                  tierId,
+                  roleId,
+                  type: purchaseType,
+                  status: "active",
+                  stripeCustomerId: session.customer ? String(session.customer) : null,
+                  stripeSubscriptionId: session.subscription ? String(session.subscription) : null,
+                  stripeSessionId: session.id,
+                  currentPeriodEnd,
+                  cancelAtPeriodEnd: false,
+                },
+                $inc: { monthsSubscribed: 1 },
               },
-            },
-            { upsert: true, new: true }
-          );
+              { upsert: true, new: true }
+            );
+            console.log(`[Banco] Assinatura salva com sucesso para ${userId} (Guild: ${guildId}, Tier: ${tierId}).`);
+          } catch (dbErr) {
+            console.error("[Banco] Erro ao salvar assinatura no MongoDB:", dbErr);
+          }
 
           // Atribui o cargo no Discord imediatamente
           await addDiscordRole(guildId, userId, roleId);
 
           // Envia notificação no canal de logs da Staff
           const endTs = Math.floor(currentPeriodEnd.getTime() / 1000);
-          await sendLogEmbed(guildId, {
-            title: "🎉 Novo VIP Ativado!",
-            color: 0x00ff88,
-            description: `O usuário <@${userId}> adquiriu o VIP **${tierId}**!`,
-            fields: [
-              { name: "Tipo", value: purchaseType === "subscription" ? "Assinatura Mensal" : `Avulso (${durationDays} dias)`, inline: true },
-              { name: "Expiração / Próx. Fatura", value: `<t:${endTs}:f>`, inline: true },
-              { name: "Cargo Entregue", value: `<@&${roleId}>`, inline: true },
-            ],
-            timestamp: new Date().toISOString(),
-          });
+          try {
+            await sendLogEmbed(guildId, {
+              title: "🎉 Novo VIP Ativado!",
+              color: 0x00ff88,
+              description: `O usuário <@${userId}> adquiriu o VIP **${tierId}**!`,
+              fields: [
+                { name: "Tipo", value: purchaseType === "subscription" ? "Assinatura Mensal" : `Avulso (${durationDays} dias)`, inline: true },
+                { name: "Expiração / Próx. Fatura", value: `<t:${endTs}:f>`, inline: true },
+                { name: "Cargo Entregue", value: `<@&${roleId}>`, inline: true },
+              ],
+              timestamp: new Date().toISOString(),
+            });
+          } catch (logErr) {
+            console.warn("[Discord] Falha ao enviar log de staff:", logErr);
+          }
 
           // Notifica o usuário por DM
-          await sendUserDm(userId, {
-            title: "🌟 Seu VIP foi Ativado com Sucesso!",
-            color: 0x00ff88,
-            description: `Parabéns! Seu benefício VIP **${tierId}** foi ativado no servidor. O seu cargo já foi entregue automaticamente!\n\n` +
-              `• **Válido até:** <t:${endTs}:f> (<t:${endTs}:R>)\n\n` +
-              `Agradecemos imensamente por apoiar nossa comunidade!`,
-            timestamp: new Date().toISOString(),
-          });
+          try {
+            await sendUserDm(userId, {
+              title: "🌟 Seu VIP foi Ativado com Sucesso!",
+              color: 0x00ff88,
+              description: `Parabéns! Seu benefício VIP **${tierId}** foi ativado no servidor. O seu cargo já foi entregue automaticamente!\n\n` +
+                `• **Válido até:** <t:${endTs}:f> (<t:${endTs}:R>)\n\n` +
+                `Agradecemos imensamente por apoiar nossa comunidade!`,
+              timestamp: new Date().toISOString(),
+            });
+          } catch (dmErr) {
+            // Ignora se DM estiver fechada
+          }
 
           break;
         }
